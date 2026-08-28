@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# conf — Confluence Cloud helper for the things `acli confluence` cannot do:
+# CQL search, page body as markdown, child listing, raw API passthrough.
+#
+# Site and email are read from the acli profile; the API token comes from
+# $CONFLUENCE_API_TOKEN or $CONFLUENCE_TOKEN_FILE (default ~/.config/acli/confluence-token).
+set -euo pipefail
+
+CFG="$HOME/.config/acli/confluence_config.yaml"
+TOKEN_FILE="${CONFLUENCE_TOKEN_FILE:-$HOME/.config/acli/confluence-token}"
+
+die() { printf 'conf: %s\n' "$*" >&2; exit 1; }
+
+[[ -r $CFG ]] || die "no acli confluence profile at $CFG — run: acli confluence auth login"
+SITE=$(grep -m1 -oP '^\s*-?\s*site:\s*\K\S+' "$CFG") || true
+EMAIL=$(grep -m1 -oP '^\s*email:\s*\K\S+' "$CFG") || true
+[[ -n ${SITE:-} && -n ${EMAIL:-} ]] || die "could not read site/email from $CFG"
+
+if [[ -n ${CONFLUENCE_API_TOKEN:-} ]]; then
+  TOKEN=$CONFLUENCE_API_TOKEN
+elif [[ -r $TOKEN_FILE ]]; then
+  TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE")
+else
+  die "no API token. Store one with:
+  install -m 600 /dev/null $TOKEN_FILE && printf '%s' '<token>' > $TOKEN_FILE
+or export CONFLUENCE_API_TOKEN"
+fi
+[[ -n $TOKEN ]] || die "token is empty ($TOKEN_FILE)"
+
+api() { # api <path-with-query> [curl args...]
+  local path=$1; shift
+  curl -sS --fail-with-body -u "$EMAIL:$TOKEN" -H 'Accept: application/json' \
+    "https://$SITE/wiki$path" "$@"
+}
+uri() { jq -rn --arg v "$1" '$v|@uri'; }
+
+usage() {
+  cat <<'EOF'
+conf search <text|CQL> [-s SPACE] [-t TYPE] [-l LIMIT] [--json]
+     text is wrapped as `text ~ "..."` unless it already looks like CQL
+conf page <id> [--raw|--json]      page body (markdown by default)
+conf children <id> [--json]        direct child pages
+conf spaces [--json]               accessible spaces
+conf labels <id>                   page labels
+conf api <path> [curl args...]     raw passthrough, e.g. conf api /api/v2/pages/123
+EOF
+}
+
+is_cql() { [[ $1 == *' ~ '* || $1 == *'='* || $1 == *' AND '* || $1 == *' OR '* || $1 == *'~"'* ]]; }
+
+cmd_search() {
+  local q='' space='' type='' limit=25 json=0
+  while (($#)); do
+    case $1 in
+      -s|--space) space=$2; shift 2 ;;
+      -t|--type)  type=$2;  shift 2 ;;
+      -l|--limit) limit=$2; shift 2 ;;
+      --json)     json=1;   shift ;;
+      *)          q="${q:+$q }$1"; shift ;;
+    esac
+  done
+  [[ -n $q ]] || die 'search needs a query'
+  local cql
+  if is_cql "$q"; then cql=$q; else cql="text ~ \"$q\""; fi
+  [[ -n $space ]] && cql="space = \"$space\" AND ($cql)"
+  [[ -n $type  ]] && cql="type = \"$type\" AND ($cql)"
+  cql="$cql ORDER BY lastmodified DESC"
+
+  local out
+  out=$(api "/rest/api/search?limit=$limit&cql=$(uri "$cql")")
+  if ((json)); then printf '%s\n' "$out" | jq .; return; fi
+  printf '%s\n' "$out" | jq -r '
+    if (.results|length) == 0 then "no results" else
+    .results[] |
+      [ (.content.id // "-"),
+        (.content.type // .entityType // "-"),
+        (.resultGlobalContainer.title // "-"),
+        (.content.title // .title // "-"),
+        (.lastModified // "" | split("T")[0])
+      ] | @tsv end' | column -t -s $'\t'
+}
+
+cmd_page() {
+  local id=${1:-} mode=md; shift || true
+  [[ -n $id ]] || die 'page needs an id'
+  case ${1:-} in --raw) mode=raw ;; --json) mode=json ;; esac
+  local out
+  out=$(api "/api/v2/pages/$id?body-format=storage")
+  case $mode in
+    json) printf '%s\n' "$out" | jq . ;;
+    raw)  printf '%s\n' "$out" | jq -r '.body.storage.value' ;;
+    md)
+      printf '# %s\n\n' "$(printf '%s' "$out" | jq -r '.title')"
+      printf '%s\n' "$out" | jq -r '.body.storage.value' \
+        | pandoc -f html -t gfm --wrap=none 2>/dev/null
+      printf '\nhttps://%s/wiki/spaces/_/pages/%s\n' "$SITE" "$id" ;;
+  esac
+}
+
+cmd_children() {
+  local id=${1:-}; [[ -n $id ]] || die 'children needs an id'
+  local out; out=$(api "/api/v2/pages/$id/children?limit=250")
+  if [[ ${2:-} == --json ]]; then printf '%s\n' "$out" | jq .; return; fi
+  printf '%s\n' "$out" | jq -r '.results[] | [.id, .title] | @tsv' | column -t -s $'\t'
+}
+
+cmd_spaces() {
+  local out; out=$(api '/api/v2/spaces?limit=250')
+  if [[ ${1:-} == --json ]]; then printf '%s\n' "$out" | jq .; return; fi
+  printf '%s\n' "$out" | jq -r '.results[] | [.key, .type, .name] | @tsv' | column -t -s $'\t'
+}
+
+cmd_labels() {
+  local id=${1:-}; [[ -n $id ]] || die 'labels needs an id'
+  api "/api/v2/pages/$id/labels?limit=250" | jq -r '.results[].name'
+}
+
+case ${1:-} in
+  search)   shift; cmd_search "$@" ;;
+  page)     shift; cmd_page "$@" ;;
+  children) shift; cmd_children "$@" ;;
+  spaces)   shift; cmd_spaces "$@" ;;
+  labels)   shift; cmd_labels "$@" ;;
+  api)      shift; api "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) die "unknown command '$1' (try: conf help)" ;;
+esac
