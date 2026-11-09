@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""mycal — read a published Outlook/Exchange ICS calendar from the command line.
+
+The calendar URL is a capability URL (anyone holding it can read the calendar),
+so it is never stored in this repository. It is read from, in order:
+
+    $MYCAL_ICS_URL
+    ~/.config/mycal/url          (one line, mode 600)
+
+The feed is cached in ~/.cache/mycal/calendar.ics and re-fetched when older than
+$MYCAL_TTL seconds (default 900). Use --refresh to force a fetch.
+
+Recurring events are expanded with their EXDATEs, and per-instance overrides
+(RECURRENCE-ID) replace the generated instance, so moved and cancelled
+occurrences show up correctly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from dateutil.rrule import rrulestr
+
+CONFIG_URL = Path(os.environ.get("MYCAL_CONFIG", Path.home() / ".config/mycal/url"))
+CACHE = Path(os.environ.get("MYCAL_CACHE", Path.home() / ".cache/mycal/calendar.ics"))
+TTL = int(os.environ.get("MYCAL_TTL", "900"))
+
+# Exchange writes Windows time zone names; map the ones this calendar uses.
+WINDOWS_TZ = {
+    "Central European Standard Time": "Europe/Warsaw",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Romance Standard Time": "Europe/Paris",
+    "GMT Standard Time": "Europe/London",
+    "GTB Standard Time": "Europe/Athens",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "UTC": "UTC",
+}
+
+LOCAL_TZ = ZoneInfo(os.environ.get("MYCAL_TZ", "Europe/Warsaw"))
+
+
+def die(msg: str) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"mycal: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def tzinfo_for(tzid: str | None) -> ZoneInfo:
+    if not tzid:
+        return LOCAL_TZ
+    name = WINDOWS_TZ.get(tzid, tzid)
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return LOCAL_TZ
+
+
+# --- feed -------------------------------------------------------------------
+
+
+def feed_url() -> str:
+    url = os.environ.get("MYCAL_ICS_URL")
+    if url:
+        return url.strip()
+    if CONFIG_URL.is_file():
+        url = CONFIG_URL.read_text().strip()
+        if url:
+            return url
+    die(f"no calendar URL — set $MYCAL_ICS_URL or write one to {CONFIG_URL}")
+
+
+def load_ics(refresh: bool = False) -> str:
+    fresh = CACHE.is_file() and (
+        dt.datetime.now().timestamp() - CACHE.stat().st_mtime < TTL
+    )
+    if fresh and not refresh:
+        return CACHE.read_text(encoding="utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(feed_url(), timeout=60) as r:
+            body = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        if CACHE.is_file():
+            print(f"mycal: fetch failed ({e}), using cached copy", file=sys.stderr)
+            return CACHE.read_text(encoding="utf-8", errors="replace")
+        die(f"fetch failed: {e}")
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(body, encoding="utf-8")
+    return body
+
+
+# --- ICS parsing ------------------------------------------------------------
+
+
+def unfold(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+PARAM_RE = re.compile(r';([^;:=]+)=("[^"]*"|[^;:]*)')
+
+
+def split_line(line: str) -> tuple[str, dict[str, str], str] | None:
+    i = line.find(":")
+    if i < 0:
+        return None
+    head, value = line[:i], line[i + 1 :]
+    j = head.find(";")
+    if j < 0:
+        return head.upper(), {}, value
+    name = head[:j].upper()
+    params = {
+        m.group(1).upper(): m.group(2).strip('"') for m in PARAM_RE.finditer(head[j:])
+    }
+    return name, params, value
+
+
+def unescape(value: str) -> str:
+    out, i = [], 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            out.append({"n": "\n", "N": "\n"}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def parse_dt(value: str, params: dict[str, str]) -> dt.datetime | dt.date:
+    value = value.strip()
+    if params.get("VALUE") == "DATE" or (len(value) == 8 and "T" not in value):
+        return dt.datetime.strptime(value, "%Y%m%d").date()
+    if value.endswith("Z"):
+        return dt.datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=dt.timezone.utc
+        )
+    naive = dt.datetime.strptime(value, "%Y%m%dT%H%M%S")
+    return naive.replace(tzinfo=tzinfo_for(params.get("TZID")))
+
+
+def parse_events(text: str) -> list[dict]:
+    events, cur = [], None
+    for line in unfold(text):
+        if line == "BEGIN:VEVENT":
+            cur = {"exdate": [], "rrule": None}
+            continue
+        if line == "END:VEVENT":
+            if cur is not None:
+                events.append(cur)
+            cur = None
+            continue
+        if cur is None:
+            continue
+        parsed = split_line(line)
+        if not parsed:
+            continue
+        name, params, value = parsed
+        if name == "DTSTART":
+            cur["start"] = parse_dt(value, params)
+        elif name == "DTEND":
+            cur["end"] = parse_dt(value, params)
+        elif name == "RECURRENCE-ID":
+            cur["recurrence_id"] = parse_dt(value, params)
+        elif name == "EXDATE":
+            cur["exdate"] += [parse_dt(v, params) for v in value.split(",") if v.strip()]
+        elif name == "RRULE":
+            cur["rrule"] = value
+        elif name in ("SUMMARY", "LOCATION", "ORGANIZER", "UID", "STATUS", "DESCRIPTION"):
+            cur[name.lower()] = unescape(value)
+        elif name == "X-MICROSOFT-CDO-ALLDAYEVENT":
+            cur["all_day"] = value.upper() == "TRUE"
+        elif name == "X-MICROSOFT-CDO-BUSYSTATUS":
+            cur["busy"] = value
+    return events
+
+
+# --- expansion --------------------------------------------------------------
+
+
+def as_aware(value: dt.datetime | dt.date) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=LOCAL_TZ)
+    return dt.datetime.combine(value, dt.time.min, tzinfo=LOCAL_TZ)
+
+
+def instances(events: list[dict], start: dt.datetime, end: dt.datetime) -> list[dict]:
+    masters = [e for e in events if "recurrence_id" not in e]
+    overrides: dict[tuple[str, str], dict] = {}
+    for e in events:
+        if "recurrence_id" in e:
+            overrides[(e.get("uid", ""), as_aware(e["recurrence_id"]).isoformat())] = e
+
+    out: list[dict] = []
+
+    def emit(event: dict, begins: dt.datetime, ends: dt.datetime) -> None:
+        if ends <= start or begins >= end:
+            return
+        if (event.get("status") or "").upper() == "CANCELLED":
+            return
+        out.append(
+            {
+                "start": begins,
+                "end": ends,
+                "subject": event.get("summary", "(no subject)"),
+                "location": event.get("location", ""),
+                "organizer": re.sub(r"^MAILTO:", "", event.get("organizer", ""), flags=re.I),
+                "all_day": bool(event.get("all_day")) or isinstance(event["start"], dt.date)
+                and not isinstance(event["start"], dt.datetime),
+                "busy": event.get("busy", ""),
+                "uid": event.get("uid", ""),
+            }
+        )
+
+    for ev in masters:
+        if "start" not in ev:
+            continue
+        first = as_aware(ev["start"])
+        last = as_aware(ev.get("end", ev["start"]))
+        duration = last - first
+        if not ev["rrule"]:
+            emit(ev, first, first + duration)
+            continue
+        try:
+            rule = rrulestr(ev["rrule"], dtstart=first)
+        except Exception:
+            emit(ev, first, first + duration)
+            continue
+        excluded = {as_aware(x).isoformat() for x in ev["exdate"]}
+        # Widen the window by the event length so long events overlapping the
+        # start of the range are still generated.
+        for occ in rule.between(start - duration, end, inc=True):
+            key = occ.isoformat()
+            if key in excluded:
+                continue
+            override = overrides.get((ev.get("uid", ""), key))
+            if override is not None:
+                o_start = as_aware(override["start"])
+                o_end = as_aware(override.get("end", override["start"]))
+                emit(override, o_start, o_end)
+            else:
+                emit(ev, occ, occ + duration)
+
+    # Overrides whose master rule no longer generates their slot (moved instances).
+    seen = {(e["uid"], e["start"].isoformat()) for e in out}
+    for ev in overrides.values():
+        begins = as_aware(ev["start"])
+        if (ev.get("uid", ""), begins.isoformat()) in seen:
+            continue
+        emit(ev, begins, as_aware(ev.get("end", ev["start"])))
+
+    out.sort(key=lambda e: e["start"])
+    return out
+
+
+# --- output -----------------------------------------------------------------
+
+
+# Locations that say nothing beyond "this is an online meeting".
+ONLINE_LOCATIONS = {
+    "Microsoft Teams Meeting",
+    "Spotkanie w aplikacji Microsoft Teams",
+}
+
+
+def render(items: list[dict], as_json: bool, window_start: dt.date | None = None) -> None:
+    if as_json:
+        print(
+            json.dumps(
+                [{**i, "start": i["start"].isoformat(), "end": i["end"].isoformat()} for i in items],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return
+    if not items:
+        print("(no events)")
+        return
+    by_day: dict[dt.date, list[dict]] = defaultdict(list)
+    for i in items:
+        day = i["start"].astimezone(LOCAL_TZ).date()
+        # An event that started before the window is listed on its first day
+        # inside it, not on a header outside the range the user asked for.
+        if window_start and day < window_start:
+            day = window_start
+        by_day[day].append(i)
+    for day in sorted(by_day):
+        print(f"\n{day:%a %Y-%m-%d}")
+        for i in by_day[day]:
+            begins = i["start"].astimezone(LOCAL_TZ)
+            ends = i["end"].astimezone(LOCAL_TZ)
+            when = "all-day    " if i["all_day"] else f"{begins:%H:%M}-{ends:%H:%M}"
+            line = f"  {when}  {i['subject']}"
+            last_day = (ends - dt.timedelta(seconds=1)).date()
+            if last_day > begins.date():
+                line += f"  ({begins:%b %-d}-{last_day:%b %-d})"
+            if i["location"] and i["location"] not in ONLINE_LOCATIONS:
+                line += f"  @ {i['location']}"
+            if i["busy"] in ("FREE", "TENTATIVE", "OOF"):
+                line += f"  [{i['busy'].lower()}]"
+            print(line)
+
+
+# --- CLI --------------------------------------------------------------------
+
+
+def day_bounds(day: dt.date) -> tuple[dt.datetime, dt.datetime]:
+    begin = dt.datetime.combine(day, dt.time.min, tzinfo=LOCAL_TZ)
+    return begin, begin + dt.timedelta(days=1)
+
+
+def parse_day(text: str) -> dt.date:
+    today = dt.date.today()
+    aliases = {
+        "today": today,
+        "tomorrow": today + dt.timedelta(days=1),
+        "yesterday": today - dt.timedelta(days=1),
+    }
+    if text in aliases:
+        return aliases[text]
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        die(f"cannot read date: {text} (use YYYY-MM-DD, today, tomorrow)")
+
+
+def main() -> None:
+    # Shared flags, accepted both before and after the subcommand.
+    # SUPPRESS keeps the subparser copies from resetting a flag given before the
+    # subcommand back to its default.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+    common.add_argument("--refresh", action="store_true", default=argparse.SUPPRESS,
+                        help="re-fetch the feed, ignoring the cache")
+
+    p = argparse.ArgumentParser(
+        prog="mycal",
+        parents=[common],
+        description="published Outlook calendar, from the shell",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("today", parents=[common])
+    sub.add_parser("tomorrow", parents=[common])
+    week = sub.add_parser("week", parents=[common], help="today plus the next N days (default 7)")
+    week.add_argument("days", nargs="?", type=int, default=7)
+    day = sub.add_parser("day", parents=[common], help="a single day")
+    day.add_argument("date")
+    rng = sub.add_parser("range", parents=[common], help="an explicit date range (end inclusive)")
+    rng.add_argument("start")
+    rng.add_argument("end")
+    find = sub.add_parser("search", parents=[common], help="events whose subject matches a pattern")
+    find.add_argument("pattern")
+    find.add_argument("--days", type=int, default=90, help="window size, default 90 days")
+    find.add_argument("--back", type=int, default=0, help="also search N days back")
+
+    args = p.parse_args()
+    cmd = args.cmd or "today"
+    as_json = getattr(args, "json", False)
+    events = parse_events(load_ics(refresh=getattr(args, "refresh", False)))
+
+    if cmd == "today":
+        start, end = day_bounds(dt.date.today())
+    elif cmd == "tomorrow":
+        start, end = day_bounds(dt.date.today() + dt.timedelta(days=1))
+    elif cmd == "day":
+        start, end = day_bounds(parse_day(args.date))
+    elif cmd == "week":
+        start, _ = day_bounds(dt.date.today())
+        end = start + dt.timedelta(days=args.days)
+    elif cmd == "range":
+        start, _ = day_bounds(parse_day(args.start))
+        _, end = day_bounds(parse_day(args.end))
+    elif cmd == "search":
+        start, _ = day_bounds(dt.date.today() - dt.timedelta(days=args.back))
+        end = start + dt.timedelta(days=args.days + args.back)
+    else:
+        p.error(f"unknown command {cmd}")
+
+    items = instances(events, start, end)
+    if cmd == "search":
+        rx = re.compile(args.pattern, re.I)
+        items = [i for i in items if rx.search(i["subject"]) or rx.search(i["location"])]
+    render(items, as_json, window_start=start.date())
+
+
+if __name__ == "__main__":
+    main()

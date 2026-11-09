@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# msgraph — Microsoft Graph helper (M365 calendar, mail metadata, raw API).
+#
+# Auth: Azure AD client-credentials flow. Reads AZURE_TENANT_ID / AZURE_CLIENT_ID /
+# AZURE_CLIENT_SECRET from the environment, or from $MSGRAPH_SECRETS_FILE
+# (default ~/Hub/Wyden/.secrets). Requires the app registration to hold the
+# matching *application* permissions (Calendars.Read for calendar commands).
+#
+# The access token is cached in $MSGRAPH_TOKEN_CACHE (default
+# ~/.cache/msgraph/token.json, mode 600) until shortly before it expires.
+set -euo pipefail
+
+SECRETS_FILE="${MSGRAPH_SECRETS_FILE:-$HOME/Hub/Wyden/.secrets}"
+CACHE_FILE="${MSGRAPH_TOKEN_CACHE:-$HOME/.cache/msgraph/token.json}"
+GRAPH="https://graph.microsoft.com/v1.0"
+
+die() { printf 'msgraph: %s\n' "$*" >&2; exit 1; }
+
+load_credentials() {
+  if [[ -z ${AZURE_TENANT_ID:-} || -z ${AZURE_CLIENT_ID:-} || -z ${AZURE_CLIENT_SECRET:-} ]]; then
+    [[ -r $SECRETS_FILE ]] || die "no AZURE_* in environment and $SECRETS_FILE is not readable"
+    # shellcheck disable=SC1090
+    set +u; source "$SECRETS_FILE"; set -u
+  fi
+  [[ -n ${AZURE_TENANT_ID:-} ]]     || die "AZURE_TENANT_ID is not set"
+  [[ -n ${AZURE_CLIENT_ID:-} ]]     || die "AZURE_CLIENT_ID is not set"
+  [[ -n ${AZURE_CLIENT_SECRET:-} ]] || die "AZURE_CLIENT_SECRET is not set"
+}
+
+mint_token() {
+  local resp err
+  resp=$(curl -sS -X POST \
+    "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+    --data-urlencode "client_id=$AZURE_CLIENT_ID" \
+    --data-urlencode "client_secret=$AZURE_CLIENT_SECRET" \
+    --data-urlencode "scope=https://graph.microsoft.com/.default" \
+    --data-urlencode "grant_type=client_credentials")
+  if ! jq -e '.access_token' >/dev/null 2>&1 <<<"$resp"; then
+    err=$(jq -r '.error_description // .error // "unknown error"' <<<"$resp" 2>/dev/null || echo "$resp")
+    die "token request failed: ${err%%$'\n'*}"
+  fi
+  mkdir -p "$(dirname "$CACHE_FILE")"
+  ( umask 077
+    jq -c --argjson now "$(date +%s)" \
+      '{access_token, expires_at: ($now + (.expires_in // 3600) - 120)}' <<<"$resp" > "$CACHE_FILE" )
+  jq -r '.access_token' "$CACHE_FILE"
+}
+
+token() {
+  if [[ -r $CACHE_FILE ]] && jq -e --argjson now "$(date +%s)" '.expires_at > $now' "$CACHE_FILE" >/dev/null 2>&1; then
+    jq -r '.access_token' "$CACHE_FILE"
+    return
+  fi
+  load_credentials
+  mint_token
+}
+
+api() { # api <path-with-query> [curl args...]
+  local path=$1; shift
+  curl -sS --fail-with-body -H "Authorization: Bearer $(token)" \
+    -H 'Accept: application/json' "$GRAPH$path" "$@"
+}
+
+uri() { jq -rn --arg v "$1" '$v|@uri'; }
+
+usage() {
+  cat <<'EOF'
+msgraph calendar [-u USER] [-d DAYS] [--from ISO] [--to ISO] [-l N] [--json]
+    calendar view (default: the next 7 days, user $MSGRAPH_USER)
+msgraph today [-u USER] [--json]      today's events
+msgraph whoami                        tenant/app/roles carried by the token
+msgraph api <path> [curl args...]     raw passthrough, e.g. msgraph api /users/x@y.io
+EOF
+}
+
+default_user() { printf '%s' "${MSGRAPH_USER:-${JIRA_EMAIL:-}}"; }
+
+fmt_events() {
+  jq -r '
+    .value
+    | if length == 0 then "(no events)" else
+      sort_by(.start.dateTime)
+      | .[]
+      | [ (.start.dateTime | sub("\\.[0-9]+$"; "") | sub("T"; " ") | .[0:16]),
+          (.end.dateTime   | sub("\\.[0-9]+$"; "") | sub("T"; " ") | .[11:16]),
+          (if .isAllDay then "[all-day]" else "" end),
+          (.subject // "(no subject)"),
+          (if (.location.displayName // "") != "" then "@ " + .location.displayName else "" end),
+          (if .isCancelled then "(CANCELLED)" else "" end)
+        ]
+      | map(select(. != "")) | join("  ")
+      end'
+}
+
+cmd_calendar() {
+  local user days=7 from='' to='' limit=100 json=0 tz
+  tz="${MSGRAPH_TZ:-$(date +%Z)}"
+  user=$(default_user)
+  while (($#)); do
+    case $1 in
+      -u|--user)  user=$2; shift 2 ;;
+      -d|--days)  days=$2; shift 2 ;;
+      --from)     from=$2; shift 2 ;;
+      --to)       to=$2;   shift 2 ;;
+      -l|--limit) limit=$2; shift 2 ;;
+      --json)     json=1; shift ;;
+      *)          die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n $user ]] || die "no user — pass -u USER or set MSGRAPH_USER"
+  [[ -n $from ]] || from=$(date -u +%Y-%m-%dT00:00:00Z)
+  [[ -n $to   ]] || to=$(date -u -d "+$days days" +%Y-%m-%dT00:00:00Z)
+
+  local out
+  out=$(api "/users/$(uri "$user")/calendarView?startDateTime=$(uri "$from")&endDateTime=$(uri "$to")&\$orderby=start/dateTime&\$top=$limit&\$select=subject,start,end,location,isAllDay,isCancelled,organizer" \
+    -H "Prefer: outlook.timezone=\"$tz\"") || {
+      printf '%s\n' "$out" >&2; exit 1; }
+  if ((json)); then printf '%s\n' "$out"; else printf '%s\n' "$out" | fmt_events; fi
+}
+
+cmd_today() {
+  local user json=0
+  user=$(default_user)
+  while (($#)); do
+    case $1 in
+      -u|--user) user=$2; shift 2 ;;
+      --json)    json=1; shift ;;
+      *)         die "unknown option: $1" ;;
+    esac
+  done
+  local args=(--from "$(date +%Y-%m-%dT00:00:00)" --to "$(date -d tomorrow +%Y-%m-%dT00:00:00)")
+  [[ -n $user ]] && args+=(-u "$user")
+  ((json)) && args+=(--json)
+  cmd_calendar "${args[@]}"
+}
+
+cmd_whoami() {
+  local t payload
+  t=$(token)
+  payload=$(cut -d. -f2 <<<"$t" | tr '_-' '/+')
+  payload=$(printf '%s%s' "$payload" "$(printf '%*s' $(( (4 - ${#payload} % 4) % 4 )) '' | tr ' ' '=')")
+  base64 -d <<<"$payload" | jq '{tenant: .tid, app: .app_displayname, appid: .appid, roles: (.roles // []), expires: (.exp | todate)}'
+}
+
+case ${1:-} in
+  calendar) shift; cmd_calendar "$@" ;;
+  today)    shift; cmd_today "$@" ;;
+  whoami)   shift; cmd_whoami ;;
+  api)      shift; [[ $# -ge 1 ]] || die "api needs a path"; p=$1; shift; api "$p" "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac
